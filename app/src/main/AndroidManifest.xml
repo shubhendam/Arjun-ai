@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Internet not strictly needed for this milestone but harmless to keep ready -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Foreground service permission so we can promote the receiver later if needed -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <application
+        android:name=".ArjunApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Arjun-AI"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar"
+        tools:targetApi="31">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Arjun-AI"
+            android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            WearableListenerService — Google Play Services auto-binds this whenever
+            the watch opens a Data Layer channel matching the path filter below.
+            We listen for any path under /arjun/* so we can add more channels later
+            (e.g. /arjun/control, /arjun/tts) without touching the manifest.
+        -->
+        <service
+            android:name=".PhoneAudioReceiverService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/arjun/audio" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>
