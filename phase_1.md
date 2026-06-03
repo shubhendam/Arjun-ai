@@ -1,41 +1,67 @@
-# Phase 1 — Watch ↔ Phone Audio Bridge
+# Phase 1 — Audio Bridge & Input Source Priority
 
-This document describes what was built in Phase 1 of Project Arjun-AI: a bidirectional audio bridge between a Galaxy Watch 4 (Wear OS) and an Android phone, with smart output routing. **No AI / LLM yet** — that's Phase 2.
+This document describes what was built in Phase 1 of Project Arjun-AI: a bidirectional audio bridge between a Galaxy Watch 4 (Wear OS), Bluetooth headsets, and an Android phone, with smart input-source selection and output routing. **No AI / LLM yet** — that's Phase 2.
 
 ## What this app does today
 
-1. User opens the Arjun-AI app on **both** the phone and the watch.
-2. On the watch, the user taps **▶ Start**. The watch starts capturing mic audio at 16 kHz mono PCM and streams it over the Wearable Data Layer to the phone.
-3. The phone receives the stream, shows live byte progress, and writes a uniquely-named `.wav` file per session into the app's private storage.
-4. User taps **🎤 Mute** to pause the stream (channel stays open), tap again to resume.
-5. User taps **⏹ Stop** to end the session — phone finalizes the WAV.
-6. The phone UI lists all past recordings with three controls per row:
-    - **▶ Play on phone** — straight playback through phone speaker / connected earbuds (OS handles routing)
-    - **⌚ Play with smart routing** — runs through `OutputRouter`: earbuds (if connected) → watch (if reachable) → phone speaker
-    - **🗑 Delete** — removes the file and the row
-7. A small dot at the top-right of the phone screen shows watch reachability (green / gray / yellow), polled every 3 seconds.
+The watch is a **trigger surface**, not necessarily the audio source. The phone decides where audio actually comes from when a session starts.
+
+1. User opens the Arjun-AI app on both phone and watch.
+2. On the watch, the user taps **▶ Start**. The watch sends a `/arjun/trigger` message ("start") to the phone — it does NOT immediately open the audio channel.
+3. The phone's `InputSourceManager` evaluates available mic sources in this priority order:
+   1. **BT headset mic** (any paired+connected device exposing HFP / SCO) → phone starts SCO and records on the phone
+   2. **Watch mic** (when no BT mic is available) → phone sends `/arjun/control` "stream" to the watch; the watch opens `/arjun/audio` and streams PCM
+   3. **Phone mic** (only when triggered from the phone UI with no BT) → phone records from its own mic
+4. User can also press **Start from phone** in the phone UI to trigger a session without using the watch.
+5. While recording, the phone UI shows live status with the chosen source name (e.g. "Recording from BT_HEADSET_MIC").
+6. User taps **⏹ Stop** on the watch (or **Stop** in the phone UI) — phone finalizes the WAV.
+7. Per-source timestamped WAVs are saved (`session_..._btmic.wav` / `_watch.wav` / `_phonemic.wav`).
+8. The phone UI lists all past recordings with three controls per row:
+   - **▶ Play on phone** — straight playback through phone speaker / connected earbuds (OS handles routing)
+   - **⌚ Play with smart routing** — runs through `OutputRouter`: earbuds (if connected) → watch (if reachable) → phone speaker
+   - **🗑 Delete** — removes file + row
+9. Top-right indicator shows watch reachability (green / gray / yellow); BT devices card shows connected earbuds/helmets with the active-audio one marked.
 
 ## Architecture
 
 ```
-Watch (wear/)                                          Phone (app/)
-─────────────                                          ────────────
-MainActivity (UI)                                      MainActivity (UI)
-   │                                                      │
-   ▼                                                      ▼
-AudioStreamer ──── /arjun/audio ───▶ PhoneAudioReceiverService
-   │            (Data Layer Channel)            │
-   ▼                                            ▼
-AudioRecord (mic)                          Writes session_*.wav
-                                                  │
-PlaybackListener ◀──── /arjun/tts ─────  WatchPlayer  ◀──── OutputRouter
-   │                                            │              ▲
-   ▼                                            ▼              │
-AudioTrack (speaker)                       MediaPlayer    decide()
-                                          (phone audio)
+Watch (wear/)                                         Phone (app/)
+─────────────                                         ────────────
+MainActivity (UI: ▶/⏸/⏹)                              MainActivity (UI)
+   │                                                     │
+   │ press ▶                                             │
+   ▼                                                     ▼
+AudioStreamer.sendTrigger("start") ─┐                PhoneTriggerListener
+                                    │                    │
+                                    │ /arjun/trigger     │
+                                    └────────────────────▶
+                                                         ▼
+                                              InputSourceManager.decide()
+                                                         │
+              ┌──────────────────┬─────────────────┬─────┴────────┐
+              ▼                  ▼                 ▼              ▼
+        BT_HEADSET_MIC      WATCH_MIC          PHONE_MIC       (idle)
+              │                  │                 │
+              │                  │ /arjun/control  │
+              │                  │ "stream"        │
+              │                  ▼                 │
+              │           ControlListener (wear)   │
+              │                  │                 │
+              │                  ▼                 │
+              │       AudioStreamer.startMicStreaming()
+              │                  │                 │
+              │                  │ /arjun/audio    │
+              │                  ▼                 │
+              │       PhoneAudioReceiverService    │
+              │                  │                 │
+              ▼                  ▼                 ▼
+          AudioRecord (phone, mic = SCO or built-in / streamed channel)
+                                  │
+                                  ▼
+                          16 kHz mono PCM → WAV file
 ```
 
-Transport is Google's **Wearable Data Layer API** (`ChannelClient`), not raw BLE/GATT. The Data Layer rides on top of whatever pairing the OS-level Wear OS / Galaxy Wearable apps already established, so we don't touch the Bluetooth radio directly. Failure modes (out of range, watch off, etc.) surface as channel-open errors and are handled by the router.
+Transport for control plane is **MessageClient** (small fire-and-forget messages, low latency, idempotent). Transport for audio (only when source is watch) is **ChannelClient** (streamed bytes). For BT mic and phone mic, no Data Layer traffic is involved — phone records natively.
 
 ## Files & where they live
 
@@ -43,108 +69,153 @@ Transport is Google's **Wearable Data Layer API** (`ChannelClient`), not raw BLE
 
 | File | Purpose |
 |---|---|
-| `MainActivity.kt` | Compose UI: header, live status card, recordings list, watch indicator. Starts `WatchConnection` polling on launch. |
-| `ArjunApplication.kt` | Empty `Application` subclass — placeholder for Phase 2 init (Gemma engine, Whisper, VAD). |
-| `AudioSink.kt` | Singleton holding two `StateFlow`s: live session status + list of saved `Recording`s. Bridges the receiver service and the UI. |
-| `PhoneAudioReceiverService.kt` | `WearableListenerService` auto-launched by Play Services when watch opens `/arjun/audio`. Reads PCM, writes timestamped WAV, calls `AudioSink.onFinished()`. |
-| `OutputRouter.kt` | Pure decision logic: detects earbuds via `AudioManager.getDevices()`, checks watch reachability via `NodeClient.connectedNodes`. Returns `EARBUDS_VIA_PHONE` / `WATCH` / `PHONE_SPEAKER`. |
-| `WatchPlayer.kt` | Streams a WAV file to the watch over `/arjun/tts`. Parses WAV header, sends a 16-byte protocol header (magic "ARJN" + sample rate + channels + bit depth), then raw PCM. |
-| `WatchConnection.kt` | Singleton that polls `connectedNodes` every 3 s and exposes a `StateFlow<Status>` for the UI dot. |
+| `MainActivity.kt` | Compose UI: header, session card with source name and live byte counter, "Start from phone" / "Stop" buttons, BT devices card, recordings list, watch indicator. |
+| `ArjunApplication.kt` | Empty `Application` subclass — placeholder for Phase 2 init (Gemma engine, VAD). |
+| `InputSourceManager.kt` | **Phase 1 centerpiece.** Decides mic source per session. Owns BT-SCO setup/teardown, `AudioRecord` lifecycle, WAV writing. Logs the actual negotiated codec (wideband vs narrowband) for diagnostics. |
+| `PhoneTriggerListener.kt` | `WearableListenerService` that catches `/arjun/trigger` messages from the watch and calls `InputSourceManager.startSession` / `stopSession`. |
+| `PhoneAudioReceiverService.kt` | `WearableListenerService` that catches `/arjun/audio` channel opens (only used when source is WATCH_MIC). Reads PCM stream, writes timestamped WAV. |
+| `AudioSink.kt` | Singleton holding `StateFlow`s: live session status + list of saved `Recording`s. Bridges receiver state and UI. |
+| `OutputRouter.kt` | Pure decision logic: detects earbuds via `AudioManager.getDevices()`, checks watch reachability. Returns `EARBUDS_VIA_PHONE` / `WATCH` / `PHONE_SPEAKER`. |
+| `WatchPlayer.kt` | Streams a WAV file to the watch over `/arjun/tts`. Sends a 16-byte header (magic "ARJN" + sample rate + channels + bit depth), then raw PCM. |
+| `WatchConnection.kt` | Polls `connectedNodes` every 3 s for the top-right reachability dot. |
+| `BluetoothDevices.kt` | Polls `AudioManager` + `BluetoothAdapter` for the Connected Devices card. Distinguishes "currently active audio sink" (green dot) from "bonded but idle" (gray dot). |
 
 ### Phone module — `app/src/main/`
 
 | File | Purpose |
 |---|---|
-| `AndroidManifest.xml` | Declares `MainActivity`, `ArjunApplication`, and the receiver service with `<intent-filter>` matching `wear://…/arjun/audio`. |
-| `../../build.gradle.kts` | minSdk 28, compileSdk 36, deps include `play-services-wearable`, `kotlinx-coroutines-play-services`, `material-icons-extended`. |
+| `AndroidManifest.xml` | Declares `MainActivity`, `ArjunApplication`, the receiver service for `/arjun/audio`, the trigger listener service for `/arjun/trigger`. Permissions: `RECORD_AUDIO`, `BLUETOOTH_CONNECT`, `MODIFY_AUDIO_SETTINGS`, `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`. |
+| `build.gradle.kts` | minSdk 28, compileSdk 36, deps include `play-services-wearable`, `kotlinx-coroutines-play-services`, `material-icons-extended`. |
 
 ### Watch module — `wear/src/main/java/com/example/arjun_ai/wear/`
 
 | File | Purpose |
 |---|---|
-| `MainActivity.kt` | Wear Compose UI with three buttons (Start/Mute/Stop). Holds an `AudioStreamer` instance, surfaces status text from it. |
-| `AudioStreamer.kt` | Opens `/arjun/audio` channel to the connected phone node, runs an `AudioRecord` loop, writes PCM bytes to the channel output stream. Honors mute via `AtomicBoolean`. |
-| `PlaybackListener.kt` | `WearableListenerService` that fires when phone opens `/arjun/tts`. Reads the 16-byte header, builds an `AudioTrack` at the declared sample rate, streams the body to it. |
+| `MainActivity.kt` | Wear Compose UI: Start sends `/arjun/trigger` "start"; Stop sends "stop"; Mute is local (only meaningful if watch is actually the source). Listens for `/arjun/control` broadcasts. |
+| `AudioStreamer.kt` | Two responsibilities: `sendTrigger(cmd)` for control messages, and `startMicStreaming()` for when phone selected WATCH_MIC and asked us to stream. |
+| `ControlListener.kt` | `WearableListenerService` catching `/arjun/control` from phone ("stream" / "stop"). Forwards as a local broadcast so `MainActivity` can react. |
+| `PlaybackListener.kt` | `WearableListenerService` for `/arjun/tts`. Reads header + builds an `AudioTrack` at declared sample rate, plays the PCM through the watch speaker. |
 
 ### Watch module — `wear/src/main/`
 
 | File | Purpose |
 |---|---|
-| `AndroidManifest.xml` | Declares `MainActivity`, mic permission, and both `<service>` blocks (only `PlaybackListener` — the streamer is started from the activity). |
-| `../../build.gradle.kts` | minSdk 30, compileSdk 36. Same Wearable + coroutines + icons deps as phone, plus Wear Compose Material. |
+| `AndroidManifest.xml` | Declares `MainActivity`, mic permission, and both `<service>` blocks (`ControlListener` + `PlaybackListener`). |
+| `build.gradle.kts` | minSdk 30, compileSdk 36. Same Wearable + coroutines + icons deps as phone, plus Wear Compose Material. |
 
 ## Key design decisions
 
 These were chosen explicitly during Phase 1 and should not be revisited casually.
 
-1. **Wearable Data Layer over raw BLE** — the POC used a custom L2CAP-style BLE socket because its smart glasses firmware required it. Watches don't expose anything similar; Data Layer is what every production Wear OS audio app uses. We get auto-reconnect, doze survival, and zero radio code.
-2. **`applicationId = com.example.arjun_ai` on both modules** — Data Layer only pairs apps with identical applicationIds across watch and phone. Module **namespaces** differ (`com.example.arjun_ai` vs `com.example.arjun_ai.wear`), but the build-output package is the same.
-3. **16 kHz mono input, configurable output sample rate** — input is fixed at 16 kHz because that's what Whisper expects in Phase 2. Output is declared per-stream in the 16-byte header (currently 16 kHz when we replay recordings; will be 24 kHz when Phase-2 TTS plugs in).
-4. **Routing priority: earbuds → watch → phone** — when earbuds are present, the user wants them. Watch beats phone speaker because the watch is on their wrist. Phone speaker is the last resort.
-5. **`pathPrefix="/arjun/audio"` not `/arjun`** — narrows the manifest filter so the receiver service doesn't also fire on `/arjun/tts`. The wear-side `PlaybackListener` similarly filters to `/arjun/tts` only.
-6. **`WearableListenerService` instead of binding manually** — Play Services auto-launches these on channel events; they survive the host app being backgrounded. The streamer (watch → phone) doesn't need this because the watch UI is the trigger.
-7. **Per-session WAV files in `filesDir/recordings/`** — not external storage, no `MANAGE_EXTERNAL_STORAGE`, no `MediaStore` complexity. Files are visible only to this app, which is what we want for now.
-8. **systemBarsPadding() on the phone layout** — content respects status bar and gesture nav. Don't remove this.
+1. **Trigger plane vs. data plane.** `/arjun/trigger` (watch → phone) and `/arjun/control` (phone → watch) are small `MessageClient` payloads. `/arjun/audio` and `/arjun/tts` are streamed `ChannelClient` data. Keeping them separate means the watch can ask for a session without committing to being the audio source.
+2. **Phone decides the mic source, not the watch.** The watch is a thin trigger. This lets the user wear earphones, press ▶ on the watch, and have the audio captured from the earphones — which is what users actually want. The watch is the trigger surface; the BT headset is the I/O.
+3. **BT SCO over A2DP for mic.** A2DP has no return mic path. SCO (the call-audio profile) is the only way to capture from a BT headset's microphone. Wideband mSBC at 16 kHz is now common (verified working on Boat Airdopes Supreme and BTSB-007NB helmet). Trade-off: A2DP music output drops or also switches to SCO during recording; acceptable because we want full attention on the assistant during a session.
+4. **`MediaRecorder.AudioSource.VOICE_RECOGNITION`, not `MIC`.** This source asks the audio framework for voice-tuned input, lower latency, and disables AEC tuned for speakerphone use that hurts close-mic capture.
+5. **Tried and rejected: Bluetooth media-key capture.** Earlier attempt to use `MediaSession` for "single tap right earbud → start session" was abandoned because (a) the OS routes media buttons to whichever media app was most recently active, and (b) the earbud firmware itself maps taps to PLAY/NEXT/PREV before transmitting, so finer events ("which bud, single vs long tap") can't be observed. The explicit watch / phone button trigger is more reliable.
+6. **Per-source filename suffix (`_btmic`, `_watch`, `_phonemic`).** Makes it obvious in the recording list which mic was used. Useful during Phase 1 verification.
+7. **`applicationId = com.example.arjun_ai` on both modules.** Data Layer only pairs apps with identical applicationIds across watch and phone. Module **namespaces** differ; the build-output package is the same.
+8. **`pathPrefix` per service, not a catch-all `/arjun`.** Each listener service has a narrow filter so audio doesn't trigger the trigger listener and vice versa.
+9. **`WearableListenerService` for everything inbound.** Play Services auto-launches them on incoming events; they survive the host app being backgrounded. No manual binding required.
+10. **Per-session WAV files in `filesDir/recordings/`.** App-private storage, no scoped-storage / `MediaStore` complexity. Files are visible only to this app.
+11. **`systemBarsPadding()` on the phone layout.** Content respects status bar and gesture nav. Don't remove.
+
+## Verified BT mic results
+
+Both test devices negotiated **wideband mSBC (true 16 kHz)** with the phone, confirmed via the diagnostic logging in `InputSourceManager.logActualAudioFormat()`:
+
+```
+=== AUDIO FORMAT ===
+  requested:    16000 Hz mono PCM16
+  AudioRecord:  16000 Hz ch=1 fmt=2
+  routed type:  7
+  product:      Airdopes Supreme / BTSB-007NB
+  device rates: [16000]
+  BT codec:     WIDEBAND (mSBC, true 16 kHz)
+====================
+```
+
+This is important for Phase 2: it means the audio we hand to Gemma is genuine 16 kHz speech, not 8 kHz upsampled. Gemma's audio understanding should work at full quality.
 
 ## How to run it (developer setup)
 
 ### One-time prep
 
-1. Pair the Galaxy Watch 4 with the phone via Samsung's **Galaxy Wearable** app (standard pairing the user already did).
-2. On the watch: Settings → About → Software → tap build number 7× to enable developer options. Then Settings → Developer options → **ADB debugging ON** and **Debug over Wi-Fi ON**. Note the IP.
-3. From the laptop: `adb connect <watch-ip>:5555`. Galaxy Watch 4 should appear in Android Studio's device dropdown as **SM-R…**.
+1. Pair the Galaxy Watch 4 with the phone via Samsung's **Galaxy Wearable** app.
+2. On the watch: Settings → About → Software → tap build number 7× to enable developer options. Then Settings → Developer options → ADB debugging ON and Debug over Wi-Fi ON. Note the IP.
+3. From the laptop: `adb connect <watch-ip>:5555`. Watch shows in Android Studio's device dropdown as **SM-R…**.
 4. Plug phone in via USB (USB debugging on).
 
 ### Build & install
 
-1. Open the `Arjun-ai` project in Android Studio.
-2. Sync Gradle. If `Unresolved reference` errors appear on `libs.androidx.*` aliases, the project's `gradle/libs.versions.toml` is missing entries — check the entries used in `app/build.gradle.kts` exist there.
-3. **Run the `app` module on the phone first.** Wait for the "Waiting for watch…" screen.
-4. **Run the `wear` module on the watch.** First launch will prompt for mic permission — Allow.
-5. Both apps share `applicationId com.example.arjun_ai` — they auto-discover via Data Layer.
+1. Open `Arjun-ai` in Android Studio, sync Gradle.
+2. Run the `app` module on the phone first.
+3. Run the `wear` module on the watch (first launch prompts mic permission — Allow).
+4. Grant "Nearby devices" permission on the phone app the first time (for BT device enumeration).
 
-### Smoke test
+### Smoke test — three scenarios
 
-| Action | Expected result |
+**1. Watch trigger + BT earphones connected**
+
+| Action | Expected |
 |---|---|
-| Open phone app | Top-right dot turns green within ~3 s, watch name shows |
-| Tap ▶ on watch | Watch shows "Streaming…", phone live card shows byte count climbing |
-| Tap 🎤 on watch | Watch says "Muted", phone bytes stop climbing |
-| Tap 🎤 again | Resumes |
-| Tap ⏹ on watch | Phone returns to "Waiting for watch…", new row appears in Recordings list |
-| Tap ▶ next to a recording | Plays on phone speaker (or earbuds if connected) |
-| Tap ⌚ next to a recording | Plays through the watch speaker (with no earbuds connected) |
-| Tap ⌚ with earbuds connected | Plays through earbuds, status line says "Routing to EARBUDS_VIA_PHONE" |
-| Power watch off | Indicator dot turns gray within ~3 s |
+| Connect earphones | Devices card shows them with green dot |
+| Press ▶ on watch | Session card flips to "● Recording from BT_HEADSET_MIC" |
+| Log shows | `TRIGGER=WATCH -> SOURCE=BT_HEADSET_MIC`, `SCO connected`, `BT codec: WIDEBAND...` |
+| Talk for 10s, press ⏹ | New row `session_..._btmic.wav` appears; play it = your voice via earphone mic |
 
-### Where files end up
+**2. Watch trigger + no BT mic**
 
-Recordings are saved at:
+| Action | Expected |
+|---|---|
+| Disconnect earphones | Card empties |
+| Press ▶ on watch | Session card: "● Recording from WATCH_MIC" |
+| Log shows | `decideSource: no BT mic -> WATCH_MIC`, `sent 'stream' to <Watch>`, `Channel opened from ...` |
+| Talk, press ⏹ | New row `session_..._watch.wav` |
+
+**3. Phone trigger + no BT mic**
+
+| Action | Expected |
+|---|---|
+| Tap **Start from phone** | "● Recording from PHONE_MIC" |
+| Log shows | `TRIGGER=PHONE_APP -> SOURCE=PHONE_MIC` |
+| Tap **Stop** | `session_..._phonemic.wav` |
+
+### Useful adb commands
+
+Full diagnostic log for the phone app:
 ```
-/data/data/com.example.arjun_ai/files/recordings/session_<yyyy-MM-dd_HH-mm-ss>.wav
+adb -d logcat --pid=$(adb -d shell pidof com.example.arjun_ai) -s InputSource:D PhoneTrigger:D ArjunAudioRx:D
 ```
 
-To pull one for inspection on a laptop:
+Mute the noisy BT-device poll spam but keep everything else:
 ```
-adb -d shell "run-as com.example.arjun_ai cat files/recordings/session_<timestamp>.wav" > out.wav
+adb -d logcat --pid=<phone-pid> BtDevices:S *:V
+```
+
+Pull a recording for inspection on the laptop:
+```
+adb -d shell "run-as com.example.arjun_ai cat files/recordings/session_<timestamp>_btmic.wav" > out.wav
 ```
 
 ## Known caveats
 
-- **First watch playback has ~1 s latency** — opening the channel and waking the `PlaybackListener` service takes a moment. Repeat plays are faster.
-- **Watch speaker is quiet** — physically tiny. Rotate the bezel during playback to raise media volume. This is hardware, not the app.
-- **App must be open on the watch at least once** for Data Layer discovery to work. After that, the receiver service on the phone can be triggered without the wear UI being foreground — but the watch user still needs the UI to press Start.
-- **Watch goes to sleep mid-playback** — long playbacks may stutter if the watch screen turns off. We'll add a wake lock in Phase 2 when TTS responses get longer.
-- **No retry on channel failure** — if the channel drops mid-stream, the current session ends and the user has to press Start again.
+- **SCO startup delay ~500ms.** The first half-second after pressing ▶ on the watch may not be captured. Tolerable for now; we'll buffer in Phase 2 when wake-word handles the entry timing.
+- **A2DP music drops during SCO recording.** Bluetooth radio limitation — can't do both at the same time. Acceptable because a session is short and music isn't the priority during it.
+- **Watch speaker is quiet.** Rotate the bezel during playback to raise media volume. Hardware constraint, not the app.
+- **No retry on channel failure.** If the watch channel drops mid-stream, the current session ends and the user has to press Start again.
+- **First watch playback has ~1 s latency.** Channel open + waking `PlaybackListener` service takes a moment. Subsequent plays are faster.
 
 ## What's next (Phase 2 entrypoints)
 
-When picking up Phase 2, the integration points are:
+When picking up Phase 2 in Claude Code, the integration points are:
 
-- `PhoneAudioReceiverService.onChannelOpened()` — instead of writing the PCM straight to disk, feed it into `VadSilero` → `WhisperEngine` (both ported from the POC).
-- `AudioSink` — keep it for debugging, but the real session lifecycle moves into a new `SessionViewModel` orchestrated like the POC's `ChatViewModel`.
-- `WatchPlayer.streamWavToWatch()` — already takes a WAV file. TTS output goes through this unchanged.
-- `OutputRouter.decide()` — already correct; just call it before every TTS playback.
-- `ArjunApplication.onCreate()` — model preload happens here, mirroring `GemmaApplication`.
+- **`InputSourceManager`** — feed the captured PCM into `VadSilero` (ported from POC) for turn-boundary detection, then send the buffered audio to the Gemma audio model (ported from POC `agentmode/AgentModelEngine.kt`). Skip Whisper; Gemma's audio understanding handles speech directly at 16 kHz.
+- **`AudioSink`** — keep for debugging; the real session lifecycle moves into a `SessionViewModel` orchestrated like the POC's `AgentModeViewModel`.
+- **`WatchPlayer.streamWavToWatch()`** — already takes a WAV file. TTS output from Phase 2 plugs in unchanged.
+- **`OutputRouter.decide()`** — already correct; call before every TTS playback.
+- **`ArjunApplication.onCreate()`** — Gemma model preload happens here, mirroring `GemmaApplication`.
+- **Tools** — `AgentModeTools.kt` + `ChatModeTools.kt` + `ContactsHelper.kt` ported in, fused into one mode.
 
-The POC reference for all of this is at `C:\Users\shash\OneDrive\Desktop\Project-Arjun\reference-app\poc_android-call\poc_android` — see `Project_scope.md` for the porting checklist.
+The POC reference is at `C:\Users\shash\OneDrive\Desktop\Project-Arjun\reference-app\poc_android-call\poc_android` — see `Project_scope.md` for the full porting checklist.
+
+Phase 3 will add wake-word ("Hey Arjun") gating after the explicit trigger, so accidental button presses don't engage the LLM.

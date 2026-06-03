@@ -1,7 +1,12 @@
 package com.example.arjun_ai.wear
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -25,10 +30,18 @@ import androidx.wear.compose.material.*
 class MainActivity : ComponentActivity() {
 
     private lateinit var streamer: AudioStreamer
+    private var onRemoteCmd: ((String) -> Unit)? = null
+
+    private val remoteCmdReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val cmd = intent?.getStringExtra(ControlListener.EXTRA_CMD) ?: return
+            onRemoteCmd?.invoke(cmd)
+        }
+    }
 
     private val micPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* result handled by recomposition */ }
+    ) { /* nothing */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,24 +52,65 @@ class MainActivity : ComponentActivity() {
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
         }
 
-        setContent { ArjunWatchApp(streamer) }
+        val filter = IntentFilter(ControlListener.ACTION_REMOTE_CMD)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(remoteCmdReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(remoteCmdReceiver, filter)
+        }
+
+        setContent {
+            ArjunWatchApp(
+                streamer = streamer,
+                registerRemoteCmd = { handler -> onRemoteCmd = handler }
+            )
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        streamer.stop()
+        streamer.stopMicStreaming()
+        try { unregisterReceiver(remoteCmdReceiver) } catch (_: Exception) {}
     }
 }
 
 @Composable
-fun ArjunWatchApp(streamer: AudioStreamer) {
+fun ArjunWatchApp(
+    streamer: AudioStreamer,
+    registerRemoteCmd: ((String) -> Unit) -> Unit
+) {
     var status by remember { mutableStateOf("Idle") }
-    var isStreaming by remember { mutableStateOf(false) }
+    var sessionActive by remember { mutableStateOf(false) }
+    var isStreaming by remember { mutableStateOf(false) }   // we are the audio src
     var isMuted by remember { mutableStateOf(false) }
 
-    Scaffold(
-        timeText = { TimeText() }
-    ) {
+    // Phone-driven commands
+    LaunchedEffect(Unit) {
+        registerRemoteCmd { cmd ->
+            when (cmd) {
+                "stream" -> {
+                    status = "Phone asked us to stream"
+                    streamer.startMicStreaming { s ->
+                        status = s
+                        if (s.startsWith("Stopped") || s.startsWith("Error")) {
+                            isStreaming = false
+                        }
+                    }
+                    isStreaming = true
+                }
+                "stop" -> {
+                    streamer.stopMicStreaming()
+                    isStreaming = false
+                    sessionActive = false
+                    isMuted = false
+                    status = "Stopped by phone"
+                }
+            }
+        }
+    }
+
+    Scaffold(timeText = { TimeText() }) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -64,17 +118,8 @@ fun ArjunWatchApp(streamer: AudioStreamer) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically)
         ) {
-            Text(
-                text = "Arjun-AI",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = status,
-                fontSize = 10.sp,
-                color = Color(0xFFAAAAAA)
-            )
-
+            Text("Arjun-AI", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(status, fontSize = 10.sp, color = Color(0xFFAAAAAA))
             Spacer(Modifier.height(4.dp))
 
             Row(
@@ -84,31 +129,23 @@ fun ArjunWatchApp(streamer: AudioStreamer) {
                 // Start
                 Button(
                     onClick = {
-                        if (!isStreaming) {
+                        if (!sessionActive) {
+                            streamer.sendTrigger("start") { status = it }
+                            sessionActive = true
                             isMuted = false
-                            streamer.setMuted(false)
-                            streamer.start { s ->
-                                status = s
-                                if (s.startsWith("Stopped") || s.startsWith("Error") ||
-                                    s.startsWith("No phone")) {
-                                    isStreaming = false
-                                }
-                            }
-                            isStreaming = true
                         }
                     },
-                    enabled = !isStreaming,
+                    enabled = !sessionActive,
                     colors = ButtonDefaults.primaryButtonColors()
                 ) {
                     Icon(Icons.Default.PlayArrow, contentDescription = "Start")
                 }
-
-                // Mute / Unmute
+                // Mute (only meaningful if WE are the source)
                 Button(
                     onClick = {
                         isMuted = !isMuted
                         streamer.setMuted(isMuted)
-                        status = if (isMuted) "Muted" else "Streaming…"
+                        status = if (isMuted) "Muted (mic only)" else "Unmuted"
                     },
                     enabled = isStreaming,
                     colors = ButtonDefaults.secondaryButtonColors()
@@ -118,16 +155,16 @@ fun ArjunWatchApp(streamer: AudioStreamer) {
                         contentDescription = "Mute"
                     )
                 }
-
                 // Stop
                 Button(
                     onClick = {
-                        streamer.stop()
+                        streamer.sendTrigger("stop") { status = it }
+                        streamer.stopMicStreaming()
+                        sessionActive = false
                         isStreaming = false
                         isMuted = false
-                        status = "Idle"
                     },
-                    enabled = isStreaming,
+                    enabled = sessionActive,
                     colors = ButtonDefaults.secondaryButtonColors()
                 ) {
                     Icon(Icons.Default.Stop, contentDescription = "Stop")

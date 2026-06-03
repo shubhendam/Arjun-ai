@@ -7,6 +7,9 @@
 
     <!-- Foreground service permission so we can promote the receiver later if needed -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application
         android:name=".ArjunApplication"
@@ -41,6 +44,15 @@
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/arjun/audio" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".PhoneTriggerListener"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/arjun/trigger" />
             </intent-filter>
         </service>
     </application>

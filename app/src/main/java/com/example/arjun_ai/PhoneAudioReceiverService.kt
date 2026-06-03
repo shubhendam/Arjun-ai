@@ -13,10 +13,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/**
- * Auto-launched by Play Services whenever the watch opens "/arjun/audio".
- * Each session is saved as a uniquely-named WAV file under filesDir/recordings/.
- */
 class PhoneAudioReceiverService : WearableListenerService() {
 
     companion object {
@@ -37,11 +33,10 @@ class PhoneAudioReceiverService : WearableListenerService() {
             val client = Wearable.getChannelClient(applicationContext)
             try {
                 val input: InputStream = client.getInputStream(channel).await()
-
                 val recordingsDir = File(filesDir, RECORDINGS_SUBDIR).apply { mkdirs() }
                 val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
-                val pcmFile = File(recordingsDir, "session_$timestamp.pcm")
-                val wavFile = File(recordingsDir, "session_$timestamp.wav")
+                val pcmFile = File(recordingsDir, "session_${timestamp}_watch.pcm")
+                val wavFile = File(recordingsDir, "session_${timestamp}_watch.wav")
 
                 val out = FileOutputStream(pcmFile)
                 val buf = ByteArray(4096)
@@ -54,15 +49,16 @@ class PhoneAudioReceiverService : WearableListenerService() {
                     AudioSink.onBytes(total)
                 }
                 out.flush(); out.close()
-
                 writeWav(pcmFile, wavFile, SAMPLE_RATE)
-                pcmFile.delete()    // we only keep the playable .wav
+                pcmFile.delete()
 
                 Log.d(TAG, "Saved WAV: ${wavFile.absolutePath} (${wavFile.length()} bytes)")
                 AudioSink.onFinished(wavFile)
             } catch (e: Exception) {
                 Log.e(TAG, "channel read failed", e)
                 AudioSink.onError(e.message ?: "unknown")
+            } finally {
+                InputSourceManager.onWatchStreamFinished()
             }
         }
     }
@@ -72,6 +68,7 @@ class PhoneAudioReceiverService : WearableListenerService() {
     ) {
         Log.d(TAG, "Channel closed reason=$closeReason")
         AudioSink.onDisconnected()
+        InputSourceManager.onWatchStreamFinished()
     }
 
     private fun writeWav(pcm: File, wav: File, sampleRate: Int) {

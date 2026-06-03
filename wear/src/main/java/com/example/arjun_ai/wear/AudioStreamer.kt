@@ -16,101 +16,113 @@ import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Records 16 kHz / mono / 16-bit PCM from the watch mic and streams the bytes
- * over a Data Layer Channel to the connected phone.
- *
- * Phone listens by registering ChannelClient.ChannelCallback on the same path.
+ * Watch-side. Two responsibilities:
+ *  1. sendTrigger(cmd) — tells the phone the user pressed start/stop.
+ *  2. startMicStreaming() — if the phone decides the watch should be the audio
+ *     source, the phone tells us via /arjun/control "stream", and we open
+ *     /arjun/audio and pump mic bytes. Stopped by /arjun/control "stop".
  */
 class AudioStreamer(private val context: Context) {
 
     companion object {
         private const val TAG = "AudioStreamer"
-        const val CHANNEL_PATH = "/arjun/audio"
+        const val TRIGGER_PATH = "/arjun/trigger"
+        const val AUDIO_CHANNEL_PATH = "/arjun/audio"
         const val SAMPLE_RATE = 16_000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val channelClient: ChannelClient = Wearable.getChannelClient(context)
 
     private var channel: ChannelClient.Channel? = null
     private var output: OutputStream? = null
     private var recorder: AudioRecord? = null
-
     private val streaming = AtomicBoolean(false)
     private val muted = AtomicBoolean(false)
     private var job: Job? = null
 
-    /** Find the first connected node (the phone). */
     private suspend fun findPhoneNode(): Node? {
         val nodes = Wearable.getNodeClient(context).connectedNodes.await()
-        Log.d(TAG, "Connected nodes: ${nodes.map { it.displayName }}")
         return nodes.firstOrNull { it.isNearby } ?: nodes.firstOrNull()
     }
 
-    @SuppressLint("MissingPermission")
-    fun start(onStatus: (String) -> Unit) {
-        if (streaming.get()) {
-            onStatus("Already streaming")
-            return
-        }
-
-        job = scope.launch {
+    /**
+     * Called when user taps a button on the watch UI.
+     * Sends a small message to the phone; phone decides what to do.
+     */
+    fun sendTrigger(cmd: String, onStatus: (String) -> Unit) {
+        scope.launch {
             try {
                 val node = findPhoneNode()
                 if (node == null) {
                     onStatus("No phone connected")
                     return@launch
                 }
-                onStatus("Opening channel to ${node.displayName}…")
+                Wearable.getMessageClient(context)
+                    .sendMessage(node.id, TRIGGER_PATH, cmd.toByteArray())
+                    .await()
+                Log.d(TAG, "trigger '$cmd' sent to ${node.displayName}")
+                onStatus("Sent '$cmd' to phone")
+            } catch (e: Exception) {
+                Log.e(TAG, "trigger send failed", e)
+                onStatus("Trigger error: ${e.message}")
+            }
+        }
+    }
 
-                channel = channelClient.openChannel(node.id, CHANNEL_PATH).await()
-                output = channelClient.getOutputStream(channel!!).await()
-                onStatus("Channel open. Recording…")
+    /**
+     * Phone has asked us to stream mic audio.
+     * Opens /arjun/audio and pumps until stopMicStreaming() is called.
+     */
+    @SuppressLint("MissingPermission")
+    fun startMicStreaming(onStatus: (String) -> Unit) {
+        if (streaming.get()) {
+            onStatus("Already streaming")
+            return
+        }
+        job = scope.launch {
+            try {
+                val node = findPhoneNode() ?: run {
+                    onStatus("No phone for streaming"); return@launch
+                }
+                val client = Wearable.getChannelClient(context)
+                channel = client.openChannel(node.id, AUDIO_CHANNEL_PATH).await()
+                output = client.getOutputStream(channel!!).await()
+                onStatus("Streaming mic to phone…")
 
                 val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
                 val bufSize = maxOf(minBuf, 4096)
-
                 recorder = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
-                    SAMPLE_RATE,
-                    CHANNEL_CONFIG,
-                    AUDIO_FORMAT,
-                    bufSize
+                    SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufSize
                 )
                 if (recorder!!.state != AudioRecord.STATE_INITIALIZED) {
-                    onStatus("AudioRecord failed to init")
-                    cleanup()
-                    return@launch
+                    onStatus("AudioRecord init failed"); cleanup(); return@launch
                 }
-
                 recorder!!.startRecording()
                 streaming.set(true)
 
                 val buf = ByteArray(bufSize)
-                var totalSent = 0L
-
+                var total = 0L
                 while (streaming.get() && isActive) {
-                    val read = recorder!!.read(buf, 0, buf.size)
-                    if (read > 0 && !muted.get()) {
+                    val n = recorder!!.read(buf, 0, buf.size)
+                    if (n > 0 && !muted.get()) {
                         try {
-                            output!!.write(buf, 0, read)
-                            totalSent += read
-                            if (totalSent % (SAMPLE_RATE * 2) < bufSize) {
-                                // roughly once per second
-                                onStatus("Streaming… ${totalSent / 1024} KB sent")
+                            output!!.write(buf, 0, n)
+                            total += n
+                            if (total % (SAMPLE_RATE * 2) < bufSize) {
+                                onStatus("Streaming… ${total / 1024} KB")
                             }
                         } catch (e: Exception) {
                             Log.e(TAG, "write failed", e)
-                            onStatus("Channel write error: ${e.message}")
                             break
                         }
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "start() failed", e)
-                onStatus("Error: ${e.message}")
+                Log.e(TAG, "startMicStreaming failed", e)
+                onStatus("Stream error: ${e.message}")
             } finally {
                 cleanup()
                 onStatus("Stopped")
@@ -118,13 +130,10 @@ class AudioStreamer(private val context: Context) {
         }
     }
 
-    fun setMuted(value: Boolean) {
-        muted.set(value)
-    }
-
+    fun setMuted(value: Boolean) { muted.set(value) }
     fun isMuted(): Boolean = muted.get()
 
-    fun stop() {
+    fun stopMicStreaming() {
         streaming.set(false)
         job?.cancel()
     }
@@ -136,7 +145,7 @@ class AudioStreamer(private val context: Context) {
         try { output?.flush() } catch (_: Exception) {}
         try { output?.close() } catch (_: Exception) {}
         output = null
-        try { channel?.let { channelClient.close(it) } } catch (_: Exception) {}
+        try { channel?.let { Wearable.getChannelClient(context).close(it) } } catch (_: Exception) {}
         channel = null
         streaming.set(false)
         muted.set(false)

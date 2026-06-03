@@ -54,6 +54,7 @@ dependencies {
     implementation(libs.androidx.material3)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.appcompat)
+    implementation("androidx.media:media:1.7.0")
 
     // ---- Watch <-> Phone bridge ----
     // Google Play Services Wearable Data Layer (ChannelClient, MessageClient, etc.)
