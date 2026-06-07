@@ -73,6 +73,9 @@ class MainActivity : ComponentActivity() {
     private val contactsPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
+    private val smsPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -97,6 +100,9 @@ class MainActivity : ComponentActivity() {
         if (checkSelfPermission(Manifest.permission.READ_CONTACTS) !=
             android.content.pm.PackageManager.PERMISSION_GRANTED)
             contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS)
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED)
+            smsPermLauncher.launch(Manifest.permission.SEND_SMS)
 
         setContent {
             ArjunTheme {

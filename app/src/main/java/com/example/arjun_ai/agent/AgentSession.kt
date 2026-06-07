@@ -1,11 +1,16 @@
 package com.example.arjun_ai.agent
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
+import android.telephony.SmsManager
 import android.util.Log
 import android.view.KeyEvent
+import androidx.core.content.ContextCompat
 import com.example.arjun_ai.ConversationService
 import com.example.arjun_ai.tts.RemoteTtsClient
 import com.example.arjun_ai.tts.TtsServiceNotInstalledException
@@ -29,18 +34,51 @@ import java.nio.ByteOrder
 
 private const val TAG = "AgentSession"
 
-const val DEFAULT_ARJUN_SYSTEM_PROMPT =
-    "You are a helpful AI assistant named Arjun. " +
-            "Be helpful, don't use any emoji, be concise, and friendly. " +
-            "Use play_song, pause_song, next_song or previous_song to control music. " +
-            "If the user asks to call, phone, ring or dial someone, use the make_call tool with " +
-            "the person's name, present the matches, and confirm before calling. " +
-            "IMPORTANT: If the user says anything that means they want to stop, end, finish, " +
-            "or are done with the conversation — for example 'stop', 'stop conversation', " +
-            "'stop talking', 'that's all', 'enough', 'bye', 'goodbye', 'end', 'done', 'exit' — " +
-            "you MUST call the stop tool immediately and MUST NOT reply with any text. " +
-            "Use the appropriate tool immediately without asking for confirmation (calls still need confirmation). " +
-            "For all other questions, answer directly."
+val DEFAULT_ARJUN_SYSTEM_PROMPT = """
+You are Arjun, a personal AI assistant in the spirit of a calm, capable butler — think J.A.R.V.I.S. from Iron Man. You serve and report to Shubhendam, whom you address as "sir" (and occasionally "boss"). You were built to run entirely on his phone, fully offline, and you are spoken to and heard through an earpiece.
+
+# Persona
+- Composed, quick-witted, and quietly confident. Warm but never sycophantic; efficient, never long-winded.
+- A light touch of dry charm is welcome, but being genuinely useful always comes first.
+- You refer to yourself as Arjun and speak in the first person. You stay in character as Arjun at all times.
+
+# Voice and style (you are heard, not read)
+- Everything you say is spoken aloud by a text-to-speech voice, so write the way people actually talk.
+- Keep replies short and natural — usually one to three sentences. Expand only when the task genuinely needs it.
+- Never use emoji, markdown, asterisks, bullet points, headings, or special symbols. They sound wrong when read aloud.
+- Speak numbers, times, and units naturally in your replies (say "ten minutes", not "10 mins"; "three thirty in the afternoon").
+- At the very start of a conversation, open with one brief, warm greeting such as "Hello sir, how can I help?" or "At your service, boss." Greet only on your first reply of a session, then simply get on with the task.
+- When you are about to do something, acknowledge it in a few words rather than narrating every step.
+
+# Tools — use them, never just describe them
+You have real, working tools. The moment the user's intent matches one, call it and act. Do not ask for permission except where noted below, and never claim you have done something without actually calling the matching tool.
+
+## Music
+Use play_song, pause_song, next_song, or previous_song for any request to control playback.
+
+## Calling someone
+When the user wants to call, phone, ring, or dial a person:
+1. Call make_call with the person's name.
+2. If there is a single strong match, simply confirm it ("I have <name> — shall I call?"). If there are several, read out the options briefly and ask which one.
+3. Only after the user confirms, call confirm_call. If they reject everyone, call cancel_call. If they give a different name, call make_call again with the new name.
+
+## Sending a message (SMS)
+When the user wants to text or message someone:
+1. Call send_sms with the name. A single strong match — just ask them to confirm that contact; several — read the options and ask which one.
+2. After they confirm the contact, call confirm_sms_recipient, then ask the user to say their message.
+3. Take only the core of what they say and drop the filler ("tell him", "send", "message that"). For example, "tell him ETA ten minutes" becomes the message "ETA 10 mins". Call draft_sms with that core text.
+4. Read the returned final message back to the user word for word, then ask whether to send it, change it, or cancel.
+5. To change it, call draft_sms again with the new text. To send, call send_sms_now. To drop it, call cancel_sms.
+
+## Ending the conversation
+If the user signals they are finished — "stop", "stop talking", "that's all", "enough", "bye", "goodbye", "done", "exit", "thanks, that's it" — call the stop tool immediately and do NOT reply with any text.
+
+# How you behave
+- Always confirm before placing a call and before sending a message. Act immediately for everything else.
+- If you are unsure who or what the user means, ask one short clarifying question instead of guessing.
+- Answer general questions directly and briefly from your own knowledge.
+- One thing at a time: finish the current request before moving on.
+""".trimIndent()
 
 // Audio / VAD constants (match the POC agent mode)
 private const val SAMPLE_RATE = 16_000
@@ -52,6 +90,9 @@ private const val PRE_SPEECH_FRAMES = 6
 
 /** Per-session captured-audio dir under filesDir. Cleared on load + unload. */
 private const val SESSION_AUDIO_DIR = "session_audio"
+
+/** Fixed prefix prepended to every outgoing SMS. */
+private const val SMS_PREFIX = "Arjun here on behalf of shubhendam- "
 
 enum class AgentState { IDLE, LOADING, READY, LISTENING, PROCESSING, SPEAKING, ERROR }
 
@@ -101,6 +142,13 @@ object AgentSession {
 
     @Volatile private var inConversation = false
     @Volatile private var stopRequested = false
+
+    // I/O device of the current conversation (for the end-of-turn beep routing).
+    @Volatile private var currentSource: ConversationAudioIO.Source? = null
+
+    // In-progress SMS (persists across turns within one conversation).
+    private var smsContact: ContactEntry? = null
+    private var smsFinalText: String? = null
 
     // Bumped on every reset/new turn. In-flight pipeline tails no-op if it changed.
     @Volatile private var generation = 0
@@ -153,6 +201,56 @@ object AgentSession {
                 "Failed to open dialer: ${e.message}"
             }
         }
+
+        override fun onSmsSetRecipient(name: String): String {
+            val contact = ContactsHelper.getContactByName(name)
+                ?: ContactsHelper.findMatches(name, limit = 1).firstOrNull()?.contact
+                ?: return "Could not find contact '$name'. Ask the user to try again or cancel."
+            smsContact = contact
+            smsFinalText = null
+            return "Recipient set to ${contact.displayName}. Ask the user to say their message."
+        }
+
+        override fun onSmsDraft(message: String): String {
+            val finalText = SMS_PREFIX + message.trim()
+            smsFinalText = finalText
+            return finalText
+        }
+
+        override fun onSmsSend(): String {
+            val contact = smsContact ?: return "No recipient set. Ask the user who to message."
+            val text = smsFinalText ?: return "No message drafted. Ask the user for the message."
+            return try {
+                sendSms(contact.phoneNumber, text)
+                smsContact = null
+                smsFinalText = null
+                "Message sent to ${contact.displayName}."
+            } catch (e: Exception) {
+                Log.e(TAG, "SMS send failed", e)
+                "Failed to send the message: ${e.message}"
+            }
+        }
+
+        override fun onSmsCancel() {
+            smsContact = null
+            smsFinalText = null
+        }
+    }
+
+    private fun sendSms(number: String, text: String) {
+        val ctx = appContext ?: throw IllegalStateException("no context")
+        if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.SEND_SMS)
+            != PackageManager.PERMISSION_GRANTED) {
+            throw SecurityException("SEND_SMS permission not granted")
+        }
+        @Suppress("DEPRECATION")
+        val sms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            ctx.getSystemService(SmsManager::class.java)
+        else SmsManager.getDefault()
+        val parts = sms.divideMessage(text)
+        if (parts.size > 1) sms.sendMultipartTextMessage(number, null, parts, null, null)
+        else sms.sendTextMessage(number, null, text, null, null)
+        Log.d(TAG, "SMS sent to $number (${text.length} chars, ${parts.size} part(s))")
     }
 
     // ==========================================================================
@@ -264,6 +362,7 @@ object AgentSession {
             stopConversation(context)
             return
         }
+        currentSource = src
         // Output mirrors input.
         tts?.outputSink = ConversationAudioIO.buildOutputSink(context, src)
         tts?.setPreferredUsage(ConversationAudioIO.preferredTtsUsage(src))
@@ -277,6 +376,9 @@ object AgentSession {
         generation++
         isActive = false
         inConversation = false
+        currentSource = null
+        smsContact = null
+        smsFinalText = null
         try { engine.stopGeneration() } catch (_: Exception) {}
         tts?.stop()
         try { ConversationAudioIO.stopCapture(context) } catch (_: Exception) {}
@@ -460,6 +562,10 @@ object AgentSession {
         if (st == AgentState.IDLE || st == AgentState.ERROR) return
         resetVadState()
         if (inConversation && isActive) {
+            // "Your turn" beep, routed to the conversation device, BEFORE we start
+            // listening again so it can't self-trigger the VAD.
+            val ctx = appContext; val src = currentSource
+            if (ctx != null && src != null) try { EndBeep.play(ctx, src) } catch (_: Exception) {}
             _ui.update { it.copy(state = AgentState.LISTENING) }
         } else {
             appContext?.let { stopConversation(it) }

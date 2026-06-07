@@ -16,6 +16,9 @@
     <!-- Call tool: read contacts + open dialer -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
 
+    <!-- SMS tool: send text messages hands-free -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+
     <!-- Gemma model file lives in /sdcard/Download/ -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />

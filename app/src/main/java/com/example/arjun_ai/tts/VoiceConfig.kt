@@ -23,6 +23,10 @@ object VoiceConfig {
         val speedLabel: String,
         /** If true, prefer premium Hindi neural voice from Google TTS */
         val premiumHindi: Boolean = false,
+        /** BCP-47 locale to force on the Android TTS engine (e.g. "en-GB"). */
+        val localeTag: String? = null,
+        /** Best-effort: prefer a male-sounding voice within the locale. */
+        val preferMale: Boolean = false,
     ) {
         val label: String get() = "$displayName ($language $gender)"
     }
@@ -35,10 +39,12 @@ object VoiceConfig {
         Voice(4, "Pratham", EngineType.PIPER, "Hindi", "Male", "OK voice", "Very fast processing"),
         Voice(5, "Priyamvada", EngineType.PIPER, "Hindi", "Female", "OK voice", "Very fast processing"),
         Voice(6, "Google Premium", EngineType.ANDROID_TTS, "Hindi", "Default", "Great voice", "Fastest processing", premiumHindi = true),
-        Voice(7, "Android TTS", EngineType.ANDROID_TTS, "English", "Default", "Basic voice", "Fastest processing", premiumHindi = false),
+        Voice(7, "Android TTS", EngineType.ANDROID_TTS, "English", "Default", "Basic voice", "Fastest processing"),
+        Voice(8, "Google Premium UK", EngineType.ANDROID_TTS, "English (UK)", "Male", "Great voice", "Fastest processing",
+            localeTag = "en-GB", preferMale = true),
     )
 
-    val DEFAULT_VOICE: Voice = ALL_VOICES[6] // Google Premium Hindi as default
+    val DEFAULT_VOICE: Voice = ALL_VOICES[8] // Google Premium English (UK, male) as default
 
     fun getById(id: Int): Voice? = ALL_VOICES.firstOrNull { it.id == id }
 }

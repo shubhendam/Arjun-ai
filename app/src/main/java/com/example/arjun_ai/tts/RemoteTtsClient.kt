@@ -124,21 +124,23 @@ class RemoteTtsClient(
             textToSpeech = TextToSpeech(context) { status ->
                 if (status == TextToSpeech.SUCCESS) {
                     val ttsEngine = textToSpeech!!
-                    if (voice?.premiumHindi == true) {
-                        val hindiVoices = (ttsEngine.voices ?: emptySet())
-                            .filter { it.locale.language == "hi" }
-                            .sortedWith(
-                                compareByDescending<android.speech.tts.Voice> { it.isNetworkConnectionRequired }
-                                    .thenBy { it.name }
-                            )
-                        if (hindiVoices.isNotEmpty()) {
-                            ttsEngine.voice = hindiVoices.first()
-                            Log.d(TAG, "Android TTS: selected ${hindiVoices.first().name}")
-                        } else {
-                            ttsEngine.language = Locale("hi", "IN")
+                    when {
+                        voice?.premiumHindi == true -> {
+                            val hindiVoices = (ttsEngine.voices ?: emptySet())
+                                .filter { it.locale.language == "hi" }
+                                .sortedWith(
+                                    compareByDescending<android.speech.tts.Voice> { it.isNetworkConnectionRequired }
+                                        .thenBy { it.name }
+                                )
+                            if (hindiVoices.isNotEmpty()) {
+                                ttsEngine.voice = hindiVoices.first()
+                                Log.d(TAG, "Android TTS: selected ${hindiVoices.first().name}")
+                            } else {
+                                ttsEngine.language = Locale("hi", "IN")
+                            }
                         }
-                    } else {
-                        ttsEngine.language = Locale.US
+                        voice?.localeTag != null -> selectLocaleVoice(ttsEngine, voice)
+                        else -> ttsEngine.language = Locale.US
                     }
                     androidTtsReady = true
                     installAndroidTtsListener()
@@ -153,6 +155,42 @@ class RemoteTtsClient(
 
         latch.await(10_000, TimeUnit.MILLISECONDS)
         return success
+    }
+
+    /**
+     * Pick an Android-TTS voice for a forced locale (e.g. en-GB), preferring premium
+     * (network) voices and — best effort — a male one. The TTS API does not expose
+     * gender, so we use known Google on-device voice-name codes as hints and log every
+     * candidate + the final choice so the exact voice can be pinned after listening.
+     */
+    private fun selectLocaleVoice(tts: TextToSpeech, voice: VoiceConfig.Voice) {
+        val locale = Locale.forLanguageTag(voice.localeTag!!)
+        tts.language = locale
+
+        val candidates = (tts.voices ?: emptySet()).filter { v ->
+            v.locale.language.equals(locale.language, true) &&
+                    (locale.country.isEmpty() || v.locale.country.equals(locale.country, true))
+        }
+        candidates.forEach { Log.d(TAG, "en-${locale.country} voice: ${it.name} network=${it.isNetworkConnectionRequired} features=${it.features}") }
+        if (candidates.isEmpty()) {
+            Log.w(TAG, "No voices for $locale — using locale default")
+            return
+        }
+
+        // Best-effort male hints for Google on-device en-GB voices, plus generic.
+        val maleHints = listOf("-gbb", "-gbd", "-rjs", "-gbc", "male", "-m-", "_male")
+        val femaleHints = listOf("-gba", "female", "_female")
+
+        val byPremium = candidates.sortedByDescending { it.isNetworkConnectionRequired }
+        val chosen = if (voice.preferMale) {
+            byPremium.firstOrNull { c -> maleHints.any { c.name.lowercase().contains(it) } }
+                ?: byPremium.firstOrNull { c -> femaleHints.none { c.name.lowercase().contains(it) } }
+                ?: byPremium.first()
+        } else {
+            byPremium.first()
+        }
+        tts.voice = chosen
+        Log.d(TAG, "Android TTS: selected ${chosen.name} (preferMale=${voice.preferMale})")
     }
 
     private fun installAndroidTtsListener() {
