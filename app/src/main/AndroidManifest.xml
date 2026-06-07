@@ -5,13 +5,36 @@
     <!-- Internet not strictly needed for this milestone but harmless to keep ready -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Foreground service permission so we can promote the receiver later if needed -->
+    <!-- Foreground service so live mic capture survives the app being backgrounded -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- Call tool: read contacts + open dialer -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- Gemma model file lives in /sdcard/Download/ -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- Signature permission for binding to the Ajna AI TTS service app -->
+    <uses-permission android:name="com.example.ajnaaitts.permission.BIND_TTS_SERVICE" />
+
+    <!-- Package visibility for the TTS service app -->
+    <queries>
+        <package android:name="com.example.ajnaaitts" />
+        <intent>
+            <action android:name="com.example.ajnaaitts.ipc.BIND" />
+        </intent>
+    </queries>
+
     <application
+        android:largeHeap="true"
         android:name=".ArjunApplication"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -55,5 +78,12 @@
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/arjun/trigger" />
             </intent-filter>
         </service>
+
+        <!-- Foreground service hosting a live agent conversation (keeps mic alive
+             when the app is backgrounded and the user triggers from the watch). -->
+        <service
+            android:name=".ConversationService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>

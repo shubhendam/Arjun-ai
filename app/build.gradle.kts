@@ -32,7 +32,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        aidl = true
+    }
 
     packaging {
         resources {
@@ -55,6 +58,11 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.appcompat)
     implementation("androidx.media:media:1.7.0")
+
+    // ---- AI: Gemma 4 E4B via LiteRT-LM + Silero VAD (ONNX) ----
+    implementation(libs.litertlm)
+    implementation(libs.tflite.gpu)
+    implementation(libs.onnxruntime.android)
 
     // ---- Watch <-> Phone bridge ----
     // Google Play Services Wearable Data Layer (ChannelClient, MessageClient, etc.)

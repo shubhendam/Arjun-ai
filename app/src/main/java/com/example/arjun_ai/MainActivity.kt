@@ -1,9 +1,13 @@
 package com.example.arjun_ai
 
 import android.Manifest
+import android.content.Intent
 import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,15 +16,20 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.Watch
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -32,6 +41,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
+import com.example.arjun_ai.agent.AgentSession
+import com.example.arjun_ai.agent.AgentState
+import com.example.arjun_ai.agent.ChatMessage
+import com.example.arjun_ai.agent.Role
+import com.example.arjun_ai.agent.isAgentModelPresent
+import com.example.arjun_ai.tts.VoiceConfig
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -43,15 +58,18 @@ class MainActivity : ComponentActivity() {
     companion object {
         var btPermissionRequester: (() -> Unit)? = null
         var micPermissionRequester: (() -> Unit)? = null
+        var contactsPermissionRequester: (() -> Unit)? = null
     }
 
     private val btPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* next poll picks it up */ }
-
+    ) { }
     private val micPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* user can retry start */ }
+    ) { }
+    private val contactsPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,26 +77,27 @@ class MainActivity : ComponentActivity() {
         AudioSink.loadFromDir(dir)
         WatchConnection.start(this, lifecycleScope)
         BluetoothDevices.start(this, lifecycleScope)
+        MemoryMeter.start(this, lifecycleScope)
 
         btPermissionRequester = {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
                 btPermLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
-            }
         }
         micPermissionRequester = { micPermLauncher.launch(Manifest.permission.RECORD_AUDIO) }
+        contactsPermissionRequester = { contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS) }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            !BluetoothDevices.hasBtPermission(this)) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !BluetoothDevices.hasBtPermission(this))
             btPermLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
-        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            android.content.pm.PackageManager.PERMISSION_GRANTED)
             micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        }
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED)
+            contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS)
 
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { PhoneScreen() }
+                Surface(modifier = Modifier.fillMaxSize()) { AppNav() }
             }
         }
     }
@@ -86,14 +105,248 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         WatchConnection.stop()
         BluetoothDevices.stop()
+        MemoryMeter.stop()
         btPermissionRequester = null
         micPermissionRequester = null
+        contactsPermissionRequester = null
         super.onDestroy()
     }
 }
 
+private enum class Screen { SETUP, CHAT, AUDIO_TEST }
+
 @Composable
-fun PhoneScreen() {
+fun AppNav() {
+    var screen by remember { mutableStateOf(Screen.SETUP) }
+    val agent by AgentSession.ui.collectAsState()
+
+    // When the model starts loading / is live, show the chat screen.
+    LaunchedEffect(agent.state) {
+        when (agent.state) {
+            AgentState.LOADING, AgentState.READY, AgentState.LISTENING,
+            AgentState.PROCESSING, AgentState.SPEAKING ->
+                if (screen == Screen.SETUP) screen = Screen.CHAT
+            AgentState.IDLE -> if (screen == Screen.CHAT) screen = Screen.SETUP
+            AgentState.ERROR -> { /* stay; chat screen shows the error */ }
+        }
+    }
+
+    when (screen) {
+        Screen.SETUP -> SetupScreen(onOpenAudioTest = { screen = Screen.AUDIO_TEST })
+        Screen.CHAT -> ChatScreen(onExitToSetup = { screen = Screen.SETUP })
+        Screen.AUDIO_TEST -> AudioTestScreen(onBack = { screen = Screen.SETUP })
+    }
+}
+
+// =============================================================================
+// Setup screen
+// =============================================================================
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SetupScreen(onOpenAudioTest: () -> Unit) {
+    val context = LocalContext.current
+    val agent by AgentSession.ui.collectAsState()
+    val connection by WatchConnection.status.collectAsState()
+    val mem by MemoryMeter.mem.collectAsState()
+    var voiceMenuOpen by remember { mutableStateOf(false) }
+    var modelPresent by remember { mutableStateOf(isAgentModelPresent()) }
+
+    val storageOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+        Environment.isExternalStorageManager() else true
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .systemBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // Top bar: hamburger | title + watch | RAM
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onOpenAudioTest) {
+                Icon(Icons.Default.Menu, contentDescription = "Audio test")
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Arjun-AI", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                WatchIndicator(connection)
+            }
+            RamMeter(mem)
+        }
+
+        Text("System prompt", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        OutlinedTextField(
+            value = agent.systemPrompt,
+            onValueChange = { AgentSession.updateSystemPrompt(it) },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp),
+            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+        )
+
+        Text("Voice", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Box {
+            OutlinedButton(onClick = { voiceMenuOpen = true }, modifier = Modifier.fillMaxWidth()) {
+                Text(agent.selectedVoice.label + " — " + agent.selectedVoice.engine.name)
+            }
+            DropdownMenu(expanded = voiceMenuOpen, onDismissRequest = { voiceMenuOpen = false }) {
+                VoiceConfig.ALL_VOICES.forEach { v ->
+                    DropdownMenuItem(
+                        text = { Text("${v.label} • ${v.qualityLabel}") },
+                        onClick = { AgentSession.selectVoice(v); voiceMenuOpen = false }
+                    )
+                }
+            }
+        }
+
+        if (!modelPresent) {
+            Text("⚠ Gemma model not found in /sdcard/Download/. Push gemma-4-E4B-it.litertlm there.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.clickable { modelPresent = isAgentModelPresent() })
+        }
+        if (!storageOk) {
+            Text("⚠ Grant 'All files access' so the model can be read — tap to open settings.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.clickable {
+                    try {
+                        context.startActivity(Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:${context.packageName}")))
+                    } catch (_: Exception) {
+                        context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    }
+                })
+        }
+
+        Button(
+            onClick = { AgentSession.loadModel(context) },
+            enabled = agent.state == AgentState.IDLE || agent.state == AgentState.ERROR,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Start Arjun AI  (load model)")
+        }
+
+        if (agent.errorMessage != null) {
+            Text(agent.errorMessage!!, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
+@Composable
+fun RamMeter(mem: MemoryMeter.Mem) {
+    Row(verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Icon(Icons.Default.Memory, contentDescription = "RAM",
+            modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Column(horizontalAlignment = Alignment.End) {
+            Text("${mem.deviceUsedMb}/${mem.deviceTotalMb} MB", fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold)
+            Text("app ${mem.appUsedMb} MB", fontSize = 9.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+// =============================================================================
+// Chat screen
+// =============================================================================
+@Composable
+fun ChatScreen(onExitToSetup: () -> Unit) {
+    val context = LocalContext.current
+    val agent by AgentSession.ui.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .systemBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Arjun", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(stateLabel(agent.state), fontSize = 12.sp, color = stateColor(agent.state))
+            }
+            OutlinedButton(onClick = {
+                AgentSession.unloadModel(context)
+                onExitToSetup()
+            }) { Text("Unload") }
+        }
+
+        when (agent.state) {
+            AgentState.LOADING -> Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    Text("Loading + warming up…", fontSize = 13.sp)
+                }
+            }
+            AgentState.ERROR -> Column {
+                Text(agent.errorMessage ?: "Error", fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = { AgentSession.unloadModel(context); onExitToSetup() }) { Text("Back to setup") }
+            }
+            else -> Text("Press ▶ on the watch to talk. Say \"stop\" or press ⏹ to end.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(agent.messages, key = { it.id }) { msg -> MessageBubble(msg) }
+        }
+    }
+}
+
+@Composable
+fun MessageBubble(msg: ChatMessage) {
+    val isUser = msg.role == Role.USER
+    Row(modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = 300.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (isUser) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surfaceVariant)
+                .padding(10.dp)
+        ) {
+            Column {
+                Text(msg.text.ifBlank { if (msg.isStreaming) "…" else "" }, fontSize = 14.sp)
+                msg.stats?.let {
+                    Text("${it.tokenCount} tok • ${"%.1f".format(it.tokensPerSecond)} tok/s",
+                        fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
+}
+
+private fun stateLabel(s: AgentState): String = when (s) {
+    AgentState.IDLE -> "Idle"
+    AgentState.LOADING -> "Loading…"
+    AgentState.READY -> "Ready — press ▶ on watch"
+    AgentState.LISTENING -> "● Listening"
+    AgentState.PROCESSING -> "Thinking…"
+    AgentState.SPEAKING -> "Speaking…"
+    AgentState.ERROR -> "Error"
+}
+
+@Composable
+private fun stateColor(s: AgentState): Color = when (s) {
+    AgentState.LISTENING -> Color(0xFF22C55E)
+    AgentState.PROCESSING -> Color(0xFF2196F3)
+    AgentState.SPEAKING -> Color(0xFFFF9800)
+    AgentState.ERROR -> MaterialTheme.colorScheme.error
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+// =============================================================================
+// Audio Test screen (Phase-1 flow, moved behind the hamburger)
+// =============================================================================
+@Composable
+fun AudioTestScreen(onBack: () -> Unit) {
     val live by AudioSink.live.collectAsState()
     val recordings by AudioSink.recordings.collectAsState()
     val connection by WatchConnection.status.collectAsState()
@@ -111,20 +364,21 @@ fun PhoneScreen() {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
             Column(modifier = Modifier.weight(1f)) {
-                Text("Arjun-AI", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                Text("Watch ↔ Phone audio bridge", fontSize = 12.sp,
+                Text("Audio Test", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("Phase-1 watch ↔ phone audio bridge", fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             WatchIndicator(connection)
         }
 
-        // Session card with phone-trigger buttons
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(14.dp)) {
                 Text(
-                    text = if (inputState.recording) "● Recording from ${inputState.source}"
-                    else "○ Idle",
+                    text = if (inputState.recording) "● Recording from ${inputState.source}" else "○ Idle",
                     fontWeight = FontWeight.SemiBold,
                     color = if (inputState.recording) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant
@@ -138,14 +392,10 @@ fun PhoneScreen() {
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
-                        onClick = {
-                            InputSourceManager.startSession(context,
-                                InputSourceManager.TriggeredFrom.PHONE_APP)
-                        },
+                        onClick = { InputSourceManager.startSession(context, InputSourceManager.TriggeredFrom.PHONE_APP) },
                         enabled = !inputState.recording
                     ) {
-                        Icon(Icons.Default.Mic, contentDescription = null,
-                            modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Start from phone")
                     }
@@ -153,30 +403,26 @@ fun PhoneScreen() {
                         onClick = { InputSourceManager.stopSession(context) },
                         enabled = inputState.recording
                     ) {
-                        Icon(Icons.Default.Stop, contentDescription = null,
-                            modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Stop")
                     }
                 }
                 if (routingStatus.isNotEmpty()) {
                     Spacer(Modifier.height(4.dp))
-                    Text(routingStatus, fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.secondary)
+                    Text(routingStatus, fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
                 }
             }
         }
 
         ConnectedDevicesCard(btDevices, btPermGranted)
 
-        Text("Recordings (${recordings.size})",
-            fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Text("Recordings (${recordings.size})", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
 
         if (recordings.isEmpty()) {
             Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                 Text("No recordings yet — press ▶ on watch or 'Start from phone'",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             LazyColumn(
@@ -201,8 +447,7 @@ fun WatchIndicator(status: WatchConnection.Status) {
     Row(verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Box(Modifier.size(10.dp).clip(CircleShape).background(dotColor))
-        Text(label, fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -212,23 +457,19 @@ fun ConnectedDevicesCard(devices: List<BluetoothDevices.Device>, permissionGrant
         Column(Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Bluetooth, contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.width(6.dp))
-                Text("Connected devices (${devices.size})",
-                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text("Connected devices (${devices.size})", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
             Spacer(Modifier.height(8.dp))
             if (!permissionGranted) {
-                Box(Modifier.fillMaxWidth().clickable {
-                    MainActivity.btPermissionRequester?.invoke()
-                }.padding(vertical = 6.dp)) {
+                Box(Modifier.fillMaxWidth().clickable { MainActivity.btPermissionRequester?.invoke() }
+                    .padding(vertical = 6.dp)) {
                     Text("⚠ Nearby-devices permission needed — tap to grant",
                         fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
                 }
             } else if (devices.isEmpty()) {
-                Text("None detected", fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("None detected", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 devices.forEach { d -> DeviceRow(d) }
             }
@@ -246,13 +487,11 @@ fun DeviceRow(d: BluetoothDevices.Device) {
         Column(modifier = Modifier.weight(1f)) {
             Text(d.name, fontSize = 13.sp,
                 fontWeight = if (d.isActiveAudio) FontWeight.SemiBold else FontWeight.Normal)
-            Text(d.subtitle, fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(d.subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (d.isActiveAudio) {
             Icon(Icons.Default.Speaker, contentDescription = "Active audio",
-                modifier = Modifier.size(14.dp),
-                tint = MaterialTheme.colorScheme.primary)
+                modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
         }
     }
 }
@@ -272,14 +511,12 @@ fun RecordingRow(rec: AudioSink.Recording, onStatus: (String) -> Unit) {
     }
 
     Card(modifier = Modifier.fillMaxWidth()) {
-        Row(modifier = Modifier.fillMaxWidth().padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically) {
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(rec.name, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 Spacer(Modifier.height(2.dp))
                 Text("${rec.sizeBytes / 1024} KB • ${formatTime(rec.createdAtMillis)}",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             IconButton(onClick = {
                 if (isPlaying) {
@@ -311,14 +548,12 @@ fun RecordingRow(rec: AudioSink.Recording, onStatus: (String) -> Unit) {
                                 player.reset(); player.setDataSource(rec.path)
                                 player.setOnCompletionListener { isPlaying = false }
                                 player.prepare(); player.start(); isPlaying = true
-                            } catch (e: Exception) {
-                                onStatus("Playback error: ${e.message}")
-                            }
+                            } catch (e: Exception) { onStatus("Playback error: ${e.message}") }
                         }
                     }
                 }
             }) {
-                Icon(Icons.Default.Watch, contentDescription = "Play with routing",
+                Icon(Icons.Default.Speaker, contentDescription = "Play with routing",
                     tint = MaterialTheme.colorScheme.primary)
             }
             IconButton(onClick = {
@@ -326,13 +561,11 @@ fun RecordingRow(rec: AudioSink.Recording, onStatus: (String) -> Unit) {
                 File(rec.path).takeIf { it.exists() }?.delete()
                 AudioSink.removeRecording(rec.path)
             }) {
-                Icon(Icons.Default.Delete, contentDescription = "Delete",
-                    tint = MaterialTheme.colorScheme.error)
+                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
             }
         }
     }
 }
 
-private fun formatTime(epochMs: Long): String {
-    return SimpleDateFormat("MMM d, HH:mm:ss", Locale.getDefault()).format(Date(epochMs))
-}
+private fun formatTime(epochMs: Long): String =
+    SimpleDateFormat("MMM d, HH:mm:ss", Locale.getDefault()).format(Date(epochMs))

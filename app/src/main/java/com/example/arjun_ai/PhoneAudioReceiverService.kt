@@ -26,9 +26,30 @@ class PhoneAudioReceiverService : WearableListenerService() {
 
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         if (channel.path != CHANNEL_PATH) return
-        Log.d(TAG, "Channel opened from ${channel.nodeId}")
-        AudioSink.onConnected()
+        Log.d(TAG, "Channel opened from ${channel.nodeId} (liveCapture=${ConversationAudioBus.liveCapture})")
 
+        // Live agent conversation: forward PCM frames to the VAD pipeline, no file.
+        if (ConversationAudioBus.liveCapture) {
+            scope.launch {
+                val client = Wearable.getChannelClient(applicationContext)
+                try {
+                    val input: InputStream = client.getInputStream(channel).await()
+                    val buf = ByteArray(4096)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        val sink = ConversationAudioBus.onWatchPcm ?: break
+                        sink(bytesToShorts(buf, n))
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "live channel read failed", e)
+                }
+            }
+            return
+        }
+
+        // Phase-1 audio-test: write a timestamped WAV.
+        AudioSink.onConnected()
         scope.launch {
             val client = Wearable.getChannelClient(applicationContext)
             try {
@@ -61,6 +82,14 @@ class PhoneAudioReceiverService : WearableListenerService() {
                 InputSourceManager.onWatchStreamFinished()
             }
         }
+    }
+
+    private fun bytesToShorts(bytes: ByteArray, len: Int): ShortArray {
+        val shorts = ShortArray(len / 2)
+        for (i in shorts.indices) {
+            shorts[i] = ((bytes[2 * i].toInt() and 0xFF) or (bytes[2 * i + 1].toInt() shl 8)).toShort()
+        }
+        return shorts
     }
 
     override fun onChannelClosed(
