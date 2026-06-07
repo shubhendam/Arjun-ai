@@ -2,19 +2,24 @@
 
 ## Vision
 
-A fully on-device personal AI assistant where the **Galaxy Watch 4 (Wear OS)** acts as the trigger surface, **Bluetooth earphones/helmets** act as the primary audio I/O, and an **Android phone** does all the heavy lifting (LLM + tools + TTS). No cloud, no API calls — everything runs locally on the phone.
+A fully on-device personal AI assistant where the **Galaxy Watch 4 (Wear OS)** acts as the trigger surface, **Bluetooth earphones/helmets** act as the primary audio I/O, 
+and an **Android phone** does all the heavy lifting (LLM + tools + TTS). No cloud, no API calls — everything runs locally on the phone.
 
-The user presses a button on the watch (or in the phone app), speaks — through whatever Bluetooth headset they're wearing, falling back to the watch or phone mic — and the phone hears them, thinks, executes actions, and speaks the response back to the same headset (or watch / phone speaker). The watch is a thin trigger + status surface; the phone is the brain; the BT headset is the I/O interface.
+The user presses a button on the watch (or in the phone app), speaks — through whatever Bluetooth headset they're wearing, falling back to the watch or phone mic — 
+and the phone hears them, thinks, executes actions, and speaks the response back to the same headset (or watch / phone speaker). 
+The watch is a thin trigger + status surface; the phone is the brain; the BT headset is the I/O interface.
 
 ## Reference / POC location
 
-The original proof-of-concept application — which already implements the full STT → LLM → tools → TTS pipeline using **smart glasses over BLE** instead of a watch + BT earphones — lives at:
+The original proof-of-concept application — which already implements the full STT → LLM → tools → TTS pipeline using **smart glasses over BLE** instead of a watch + 
+BT earphones — lives at:
 
 ```
-C:\Users\shash\OneDrive\Desktop\Project-Arjun\reference-app\poc_android-call\poc_android
+C:\Users\shash\OneDrive\Desktop\Project-Arjun\reference-app\poc_android
 ```
 
-This is the **authoritative reference for everything AI-side**: Gemma LLM hosting via LiteRT-LM, Whisper STT, Silero VAD, function-calling with `FunctionGemmaEngine`, agent-mode multi-step tool use, FastVLM vision, contacts/calling tools, etc. Whenever Arjun-AI needs an AI subsystem ported, copy the implementation from there.
+This is the **authoritative reference for everything AI-side**: Gemma LLM hosting via LiteRT-LM, Whisper STT, Silero VAD, function-calling with `FunctionGemmaEngine`, 
+agent-mode multi-step tool use, FastVLM vision, contacts/calling tools, etc. Whenever Arjun-AI needs an AI subsystem ported, copy the implementation from there.
 
 The new Arjun-AI app (this project) lives at:
 
@@ -80,9 +85,11 @@ The user only interacts with the watch buttons (or earphone implicit-trigger lat
 
 ### Phase 2 — Port the Gemma agent loop from POC
 
-**Goal:** Plug the existing POC's AI stack into the audio bridge built in Phase 1. After this phase, pressing ▶ on the watch (or in the phone app) and speaking gets a real spoken AI response back through the BT headset / watch / phone.
+**Goal:** Plug the existing POC's AI stack into the audio bridge built in Phase 1. After this phase, pressing ▶ on the watch (or in the phone app) and speaking gets a
+real spoken AI response back through the BT headset / watch / phone.
 
-**Approach:** **Use Gemma's native audio understanding directly** (no Whisper STT step) since the wideband SCO mic gives us true 16 kHz audio that Gemma 3n / Gemma 4 audio variants accept directly. This skips the Whisper port from the POC entirely — simpler pipeline, fewer moving parts.
+**Approach:** **Use Gemma's native audio understanding directly** (no Whisper STT step) since the wideband SCO mic gives us true 16 kHz audio that Gemma 3n / Gemma 4 
+audio variants accept directly. This skips the Whisper port from the POC entirely — simpler pipeline, fewer moving parts.
 
 Steps (port each from the POC at `C:\Users\shash\OneDrive\Desktop\Project-Arjun\reference-app\poc_android-call\poc_android`):
 

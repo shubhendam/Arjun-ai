@@ -49,7 +49,7 @@ AudioStreamer.sendTrigger("start") ─┐                PhoneTriggerListener
               │                  │                 │
               │                  ▼                 │
               │       AudioStreamer.startMicStreaming()
-              │                  │                 │
+              │                  │                 │ 
               │                  │ /arjun/audio    │
               │                  ▼                 │
               │       PhoneAudioReceiverService    │
