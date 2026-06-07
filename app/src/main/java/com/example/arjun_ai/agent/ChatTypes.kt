@@ -23,4 +23,6 @@ data class ChatMessage(
     val text: String,
     val isStreaming: Boolean = false,
     val stats: InferenceStats? = null,
+    /** For USER voice turns: path to the captured WAV so it can be replayed. */
+    val audioPath: String? = null,
 )

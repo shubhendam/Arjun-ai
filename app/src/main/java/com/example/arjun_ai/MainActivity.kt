@@ -46,6 +46,9 @@ import com.example.arjun_ai.agent.AgentState
 import com.example.arjun_ai.agent.ChatMessage
 import com.example.arjun_ai.agent.Role
 import com.example.arjun_ai.agent.isAgentModelPresent
+import com.example.arjun_ai.theme.ArjunTheme
+import com.example.arjun_ai.theme.StatusOrb
+import com.example.arjun_ai.theme.jarvisBackground
 import com.example.arjun_ai.tts.VoiceConfig
 import kotlinx.coroutines.launch
 import java.io.File
@@ -96,8 +99,8 @@ class MainActivity : ComponentActivity() {
             contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS)
 
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { AppNav() }
+            ArjunTheme {
+                Box(modifier = Modifier.fillMaxSize().jarvisBackground()) { AppNav() }
             }
         }
     }
@@ -168,7 +171,11 @@ fun SetupScreen(onOpenAudioTest: () -> Unit) {
                 Icon(Icons.Default.Menu, contentDescription = "Audio test")
             }
             Column(modifier = Modifier.weight(1f)) {
-                Text("Arjun-AI", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text("ARJUN", fontSize = 24.sp, fontWeight = FontWeight.Black,
+                    letterSpacing = 6.sp, color = MaterialTheme.colorScheme.primary)
+                Text("// LOCAL AI ASSISTANT", fontSize = 9.sp, letterSpacing = 2.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(3.dp))
                 WatchIndicator(connection)
             }
             RamMeter(mem)
@@ -254,6 +261,7 @@ fun RamMeter(mem: MemoryMeter.Mem) {
 fun ChatScreen(onExitToSetup: () -> Unit) {
     val context = LocalContext.current
     val agent by AgentSession.ui.collectAsState()
+    val mem by MemoryMeter.mem.collectAsState()
 
     Column(
         modifier = Modifier
@@ -263,10 +271,23 @@ fun ChatScreen(onExitToSetup: () -> Unit) {
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Arjun", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text(stateLabel(agent.state), fontSize = 12.sp, color = stateColor(agent.state))
+            Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                StatusOrb(
+                    color = stateColor(agent.state),
+                    active = agent.state == AgentState.LISTENING ||
+                            agent.state == AgentState.PROCESSING ||
+                            agent.state == AgentState.SPEAKING,
+                    size = 16.dp,
+                )
+                Column {
+                    Text("ARJUN", fontSize = 20.sp, fontWeight = FontWeight.Black,
+                        letterSpacing = 4.sp, color = MaterialTheme.colorScheme.primary)
+                    Text(stateLabel(agent.state), fontSize = 11.sp, color = stateColor(agent.state))
+                }
             }
+            RamMeter(mem)
+            Spacer(Modifier.width(12.dp))
             OutlinedButton(onClick = {
                 AgentSession.unloadModel(context)
                 onExitToSetup()
@@ -304,22 +325,67 @@ fun MessageBubble(msg: ChatMessage) {
     val isUser = msg.role == Role.USER
     Row(modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
-        Box(
-            modifier = Modifier
-                .widthIn(max = 300.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(if (isUser) MaterialTheme.colorScheme.primaryContainer
-                else MaterialTheme.colorScheme.surfaceVariant)
-                .padding(10.dp)
-        ) {
-            Column {
-                Text(msg.text.ifBlank { if (msg.isStreaming) "…" else "" }, fontSize = 14.sp)
-                msg.stats?.let {
-                    Text("${it.tokenCount} tok • ${"%.1f".format(it.tokensPerSecond)} tok/s",
-                        fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Column(horizontalAlignment = if (isUser) Alignment.End else Alignment.Start) {
+            Box(
+                modifier = Modifier
+                    .widthIn(max = 300.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (isUser) MaterialTheme.colorScheme.primaryContainer
+                    else MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(10.dp)
+            ) {
+                Column {
+                    Text(msg.text.ifBlank { if (msg.isStreaming) "…" else "" }, fontSize = 14.sp)
+                    msg.stats?.let {
+                        Text("${it.tokenCount} tok • ${"%.1f".format(it.tokensPerSecond)} tok/s",
+                            fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
+            if (msg.audioPath != null) {
+                Spacer(Modifier.height(3.dp))
+                AudioMiniPlayer(msg.audioPath)
+            }
         }
+    }
+}
+
+@Composable
+fun AudioMiniPlayer(path: String) {
+    var isPlaying by remember { mutableStateOf(false) }
+    val player = remember { MediaPlayer() }
+    DisposableEffect(path) {
+        onDispose {
+            try { player.stop() } catch (_: Exception) {}
+            try { player.release() } catch (_: Exception) {}
+        }
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+            .clickable {
+                if (isPlaying) {
+                    try { player.stop() } catch (_: Exception) {}
+                    try { player.reset() } catch (_: Exception) {}
+                    isPlaying = false
+                } else if (File(path).exists()) {
+                    try {
+                        player.reset(); player.setDataSource(path)
+                        player.setOnCompletionListener { isPlaying = false }
+                        player.setOnErrorListener { _, _, _ -> isPlaying = false; true }
+                        player.prepare(); player.start(); isPlaying = true
+                    } catch (e: Exception) { isPlaying = false }
+                }
+            }
+            .padding(horizontal = 8.dp, vertical = 3.dp)
+    ) {
+        Icon(if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
+            contentDescription = "Play your audio",
+            modifier = Modifier.size(15.dp), tint = MaterialTheme.colorScheme.primary)
+        Text("your voice", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -368,8 +434,9 @@ fun AudioTestScreen(onBack: () -> Unit) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             Column(modifier = Modifier.weight(1f)) {
-                Text("Audio Test", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text("Phase-1 watch ↔ phone audio bridge", fontSize = 11.sp,
+                Text("AUDIO TEST", fontSize = 20.sp, fontWeight = FontWeight.Black,
+                    letterSpacing = 3.sp, color = MaterialTheme.colorScheme.primary)
+                Text("// phase-1 watch ↔ phone bridge", fontSize = 10.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             WatchIndicator(connection)

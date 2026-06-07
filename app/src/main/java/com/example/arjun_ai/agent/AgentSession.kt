@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -48,6 +49,9 @@ private const val BYTES_PER_SAMPLE = 2
 private const val SPEECH_DURATION_MS = 150
 private const val SILENCE_DURATION_MS = 1200
 private const val PRE_SPEECH_FRAMES = 6
+
+/** Per-session captured-audio dir under filesDir. Cleared on load + unload. */
+private const val SESSION_AUDIO_DIR = "session_audio"
 
 enum class AgentState { IDLE, LOADING, READY, LISTENING, PROCESSING, SPEAKING, ERROR }
 
@@ -163,6 +167,7 @@ object AgentSession {
     fun loadModel(context: Context) {
         if (engine.isLoaded) return
         appContext = context.applicationContext
+        clearSessionAudio() // drop any leftovers from a previous/crashed session
         _ui.update { it.copy(state = AgentState.LOADING, errorMessage = null) }
 
         scope.launch {
@@ -230,6 +235,7 @@ object AgentSession {
             tts?.destroy(); tts = null
             if (engine.isLoaded) engine.unload()
             tools.callback = null
+            clearSessionAudio() // session over → delete all captured turn audio
             _ui.value = AgentUiState()
             Log.d(TAG, "Arjun unloaded")
         }
@@ -346,7 +352,8 @@ object AgentSession {
             val gen = generation
             val startTime = System.currentTimeMillis()
 
-            val userMsg = ChatMessage(role = Role.USER, text = "🎤 (voice)")
+            val audioPath = saveTurnAudio(audioBytes)
+            val userMsg = ChatMessage(role = Role.USER, text = "🎤 (voice)", audioPath = audioPath)
             val modelMsg = ChatMessage(role = Role.MODEL, text = "", isStreaming = true)
             _ui.update {
                 it.copy(messages = it.messages + userMsg + modelMsg, isGenerating = true, state = AgentState.SPEAKING)
@@ -462,6 +469,27 @@ object AgentSession {
     // ==========================================================================
     // Helpers
     // ==========================================================================
+    /** Write a turn's WAV bytes to the session dir; returns its path (or null). */
+    private fun saveTurnAudio(wav: ByteArray): String? {
+        val ctx = appContext ?: return null
+        return try {
+            val dir = File(ctx.filesDir, SESSION_AUDIO_DIR).apply { mkdirs() }
+            val f = File(dir, "turn_${System.currentTimeMillis()}.wav")
+            f.writeBytes(wav)
+            f.absolutePath
+        } catch (e: Exception) {
+            Log.e(TAG, "saveTurnAudio failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Delete every captured turn-audio file for the session. */
+    private fun clearSessionAudio() {
+        val ctx = appContext ?: return
+        try { File(ctx.filesDir, SESSION_AUDIO_DIR).listFiles()?.forEach { it.delete() } }
+        catch (_: Exception) {}
+    }
+
     private fun resetVadState() {
         wasSpeaking = false
         speechBuffer.clear()

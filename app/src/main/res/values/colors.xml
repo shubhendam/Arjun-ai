@@ -7,4 +7,9 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- JARVIS dark palette -->
+    <color name="arjun_bg">#FF05080D</color>
+    <color name="arjun_surface">#FF0F1620</color>
+    <color name="arjun_cyan">#FF22D3EE</color>
 </resources>
